@@ -1,0 +1,178 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// CONFIG — edit these before running
+// ─────────────────────────────────────────────────────────────────────────────
+const SPREADSHEET_ID    = "1lZz3mHAUUtwsI9hB9_9f99MBg5L2sM2mT0q_knkC2YM";
+const TEMPLATE_SLIDE_ID = "1Cn91tCzyTlR3tZnEnwESzlMp4BuofFwMdE6_aMzsm18";
+const SENDER_NAME       = "BrightChamps";
+const SHEET_NAME        = "Sheet1"; // Change if your sheet tab has a different name
+
+const START_ROW = 2; // Process from this row onwards (sheet row number, 1-based)
+
+// Column indices (1-based)
+const COL_STUDENT_EMAIL = 2;   // B — Student email
+const COL_STUDENT_NAME  = 3;   // C — Student name
+const COL_TEACHER_NAME  = 4;   // D — Teacher name
+const COL_APP_NAME      = 5;   // E — App name
+const COL_TEACHER_EMAIL = 10;  // J — Teacher email (CC)
+const COL_AMAZON_LINK   = 19;  // S — Amazon app link
+const COL_STATUS        = 21;  // U — Certificate Email Status
+// ─────────────────────────────────────────────────────────────────────────────
+
+
+function sendCertificates() {
+  const ss    = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const sheet = ss.getSheetByName(SHEET_NAME);
+  const data  = sheet.getDataRange().getValues();
+
+  const today    = new Date();
+  const certDate = Utilities.formatDate(today, Session.getScriptTimeZone(), "d MMMM yyyy");
+
+  // Build a set of emails already sent (from ALL rows, not just from START_ROW)
+  // This prevents re-sending even if the same student appears again
+  const alreadySentEmails = new Set();
+  for (let i = 1; i < data.length; i++) {
+    const st = (data[i][COL_STATUS - 1] || "").toString().trim().toLowerCase();
+    if (["sent", "email sent", "done"].includes(st)) {
+      const em = (data[i][COL_STUDENT_EMAIL - 1] || "").toString().trim().toLowerCase();
+      if (em) alreadySentEmails.add(em);
+    }
+  }
+
+  let sent = 0, skipped = 0, errors = 0;
+
+  // Convert START_ROW (1-based sheet row) to array index
+  // Row 1 = header = index 0, so sheet row N = index N-1
+  const startIndex = START_ROW - 1;
+
+  for (let i = startIndex; i < data.length; i++) {
+    const row          = data[i];
+    const studentEmail = (row[COL_STUDENT_EMAIL - 1] || "").toString().trim();
+    const studentName  = (row[COL_STUDENT_NAME  - 1] || "").toString().trim();
+    const teacherName  = (row[COL_TEACHER_NAME  - 1] || "").toString().trim();
+    const appName      = (row[COL_APP_NAME      - 1] || "").toString().trim();
+    const teacherEmail = (row[COL_TEACHER_EMAIL - 1] || "").toString().trim();
+    const amazonLink   = (row[COL_AMAZON_LINK   - 1] || "").toString().trim();
+    const status       = (row[COL_STATUS        - 1] || "").toString().trim().toLowerCase();
+
+    const sheetRow = i + 1; // back to 1-based sheet row number
+
+    // Skip if Column U already marked as sent
+    if (["sent", "email sent", "done"].includes(status)) {
+      Logger.log(`[SKIP] Row ${sheetRow}: ${studentName} — Column U already marked "${status}".`);
+      skipped++;
+      continue;
+    }
+
+    // Skip if no email or name
+    if (!studentEmail || !studentName) {
+      Logger.log(`[SKIP] Row ${sheetRow}: missing email or name.`);
+      skipped++;
+      continue;
+    }
+
+    // Skip if this email was already sent in a previous row
+    if (alreadySentEmails.has(studentEmail.toLowerCase())) {
+      Logger.log(`[SKIP] Row ${sheetRow}: ${studentEmail} — already sent to this email in another row.`);
+      sheet.getRange(sheetRow, COL_STATUS).setValue("Duplicate - Already Sent");
+      skipped++;
+      continue;
+    }
+
+    Logger.log(`[ROW ${sheetRow}] Processing: ${studentName} <${studentEmail}>`);
+
+    try {
+      // 1. Copy the template slide
+      const copyFile = DriveApp.getFileById(TEMPLATE_SLIDE_ID).makeCopy(`Certificate_${studentName}_${Date.now()}`);
+      const copyId   = copyFile.getId();
+
+      // 2. Replace placeholders
+      const presentation = SlidesApp.openById(copyId);
+      const slide        = presentation.getSlides()[0];
+      slide.replaceAllText("<<date>>",                   certDate);
+      slide.replaceAllText("<<Student-Developer Name>>", studentName);
+      slide.replaceAllText("<<What is your App name?>>", appName);
+      presentation.saveAndClose();
+
+      // 3. Export as PDF
+      const pdfBlob = DriveApp.getFileById(copyId)
+        .getAs("application/pdf")
+        .setName(`${studentName}_Certificate.pdf`);
+
+      // 4. Send email
+      const mailOptions = {
+        name:        SENDER_NAME,
+        attachments: [pdfBlob],
+        htmlBody:    buildEmailBody(studentName, teacherName, appName, amazonLink),
+      };
+      if (teacherEmail) mailOptions.cc = teacherEmail;
+
+      GmailApp.sendEmail(studentEmail, `App Publishing Certificate - ${studentName}`, "", mailOptions);
+      Logger.log(`  Email sent to: ${studentEmail}  CC: ${teacherEmail}`);
+
+      // 5. Delete temp copy from Drive
+      DriveApp.getFileById(copyId).setTrashed(true);
+
+      // 6. Mark as sent in Column U
+      sheet.getRange(sheetRow, COL_STATUS).setValue("Email Sent");
+
+      // 7. Add to sent set so duplicates later in this run are also caught
+      alreadySentEmails.add(studentEmail.toLowerCase());
+
+      sent++;
+
+    } catch (e) {
+      Logger.log(`  ERROR on row ${sheetRow}: ${e.message}`);
+      sheet.getRange(sheetRow, COL_STATUS).setValue(`Error: ${e.message}`);
+      errors++;
+    }
+
+    Utilities.sleep(1000);
+  }
+
+  Logger.log(`\n=== DONE === Sent: ${sent} | Skipped: ${skipped} | Errors: ${errors}`);
+  SpreadsheetApp.getUi().alert(`Done!\n\nSent: ${sent}\nSkipped: ${skipped}\nErrors: ${errors}`);
+}
+
+
+function buildEmailBody(studentName, teacherName, appName, amazonLink) {
+  const amazonLine = amazonLink
+    ? `<p>Amazon Appstore: <a href="${amazonLink}">${amazonLink}</a></p>`
+    : "";
+
+  return `<div style="font-family: Arial, sans-serif; font-size: 14px; color: #000000; line-height: 1.8;">
+
+<p>Dear Parent,</p>
+
+<p>Greetings of the Day! We are thrilled to share some exciting news with you! Your child, <strong>${studentName}</strong> has achieved something truly remarkable. They've created and published their own app, <strong>${appName}</strong> which is now available for download.</p>
+
+<p>With remarkable coding skills and creativity, <strong>${studentName}</strong> and our dedicated faculty member, <strong>${teacherName}</strong> collaborated to bring the <strong>${appName}</strong> app to life.</p>
+
+<p>Here are the links to download your app:</p>
+
+${amazonLine}
+
+<p>This accomplishment speaks volumes about <strong>${studentName}</strong>'s dedication and the support they've received from their Bright Champs course. We would like to extend our heartfelt appreciation to <strong>${teacherName}</strong> for guiding and motivating your child throughout this journey.</p>
+
+<p>Their perseverance and creativity are truly inspiring. We encourage them to continue exploring and learning, as this is just the beginning of their journey.</p>
+
+<p>Attached is a certificate of achievement to commemorate this special milestone.</p>
+
+<p>Feel free to share this wonderful news with friends and family, and don't hesitate to spread the word about the app.</p>
+
+<p>It will be great if you can share the pic of <strong>${studentName}</strong> to share the happiness on social networks.</p>
+
+<p><strong>Warm regards,</strong><br>
+<strong>APP Publishing Team</strong><br>
+<strong>Bright CHAMPS &#128640;</strong></p>
+
+</div>`;
+}
+
+
+// Adds a custom menu to the Sheet for one-click triggering
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu("Certificates")
+    .addItem("Send Certificates", "sendCertificates")
+    .addToUi();
+}
